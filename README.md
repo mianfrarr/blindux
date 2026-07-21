@@ -4,6 +4,16 @@ A lightweight, in-situ deployment tool designed to run Arch Linux natively from 
 
 Designed around an **On-Site Provisioning** architecture, Blindux eliminates the need for complex host cross-compilation or permanent disk repartitioning.
 
+>⚠️ **DISCLAIMER & RESPONSIBILITY NOTICE**
+>
+>**This tool is experimental.**
+> 
+>Blindux interacts directly with disk images and BitLocker-encrypted partitions at a low level.
+>
+>The author(s) and contributor(s) take **no responsibility** for any potential data loss, drive corruption, system malfunction, or hardware damage caused by the use or misuse of this software.
+>
+>Always back up your critical data on Windows before using this tool.
+
 ---
 
 ## 🎯 Purpose (What & How)
