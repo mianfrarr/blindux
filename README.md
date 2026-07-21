@@ -51,12 +51,12 @@ Blindux operates through a **two-phase workflow**:
 ### **Step 1: Create the Provisioning USB**
 
 1. Clone this repository:
-$$$bash
+```bash
 git clone https://github.com/YOUR_USERNAME/blindux.git
 cd blindux
-$$$
+```
 
-2. Run the preparation script on your admin machine:
+3. Run the preparation script on your admin machine:
 ```bash
 sudo ./blindux.sh
 ```
