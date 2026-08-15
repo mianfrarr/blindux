@@ -5,6 +5,7 @@
 2. **Host Privilege Requirements:** Must be executed with root privileges (`sudo`) under WSL or any standard Linux distribution.
 3. **Environment Assets:** Host environment must feature standard raw image utilities, loop device management tools, `cryptsetup`, `dislocker`, `ntfs-3g`, and `arch-install-scripts` (or native `pacstrap` / `pacman-key`).
 4. **Markdown Code Block Enforcement:** As an absolute structural constraint, this entire architecture document, its technical specifications, and any derived deployment scripts MUST ALWAYS be shared with the Creator inside a clean Markdown code block to guarantee direct, unpolluted portability and seamless downloading.
+5. **Automated Git Version Control & Rollback Governance:** The project workspace must maintain an active Git version control repository. All architectural updates, script refactors, and milestones must be systematically committed with clear, descriptive commit messages. Rollbacks and checkpoints must be managed automatically to guarantee seamless state preservation and version recovery.
 
 ### Project Governance & Semantic Versioning (SemVer)
 * All architecture specifications, skeletons, and derived installer scripts must strictly follow the standard Semantic Versioning (SemVer) scheme (`MAJOR.MINOR.PATCH`).
