@@ -1,0 +1,13 @@
+# Blindux build and output artifacts (large raw image files)
+blindux/
+*.img
+*.iso
+
+# Backup and temporary files
+*.bak
+*.tmp
+*~
+
+# Sensitive recovery key files
+bitlocker.txt
+*.key

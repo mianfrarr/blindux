@@ -1,819 +1,724 @@
 #!/usr/bin/env bash
-#
+
 # ==============================================================================
-# BLINDUX INSTALLER MAESTRO (v0.0.63)
+# BLINDUX INSTALLATION & ORCHESTRATION SCRIPT
 # ==============================================================================
-# Objective: Bootstraps an isolated Linux system inside a raw disk image nested 
-#            on a BitLocker NTFS partition, managed by a self-contained bootable 
-#            USB drive containing GRUB and a LUKS key vault.
-#
-# SKELETON SYNC VERSION: v0.0.63
-# GOVERNANCE SYSTEM: Strict Semantic Versioning (SemVer)
-#
-# Constraints: Run as root (sudo). Works on any standard Linux distribution.
-# Language: English (US) for all logs, code comments, and CLI outputs.
+# Architecture Baseline: BLINDUX SYSTEM SPECIFICATION (v0.1.0)
+# Target Environment: Arch Linux Host / WSL / Linux -> Isolated Root Image & USB Boot Provisioning
 # ==============================================================================
 
 set -euo pipefail
 
-# --- IMMUTABLE VERSION TRACKING ---
-readonly SKELETON_VERSION="v0.0.63"
-readonly SCRIPT_VERSION="v0.0.63"
+# --- IMMUTABLE VERSION DECLARATION ---
+readonly SKELETON_VERSION="0.1.0"
+readonly SCRIPT_VERSION="0.1.0"
 
-# --- ENFORCE ROOT PRIVILEGES BUT CAPTURE REAL CALLER ---
-if [ "$EUID" -ne 0 ]; then
-    echo -e "\033[0;31m[ERROR] This script must be run as root (sudo).\033[0m" >&2
-    exit 1
-fi
+# --- GLOBAL PATHS & ENVIRONMENT VARS ---
+WORKSPACE_DIR="./blindux"
+BUILD_DIR="${WORKSPACE_DIR}/build"
+MOUNT_DIR="/mnt/blindux_root"
+USB_MOUNT_DIR="/mnt/blindux_usb_boot"
+TEMPLATE_IMG="${WORKSPACE_DIR}/blindux.fs.img"
 
-# Capture the real, non-root user details
-export REAL_USER="${SUDO_USER:-$USER}"
-export REAL_UID="${SUDO_UID:-$(id -u)}"
-export REAL_GID="${SUDO_GID:-$(id -g)}"
+# Capture original calling user to prevent root-locking on host
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_UID="${SUDO_UID:-$(id -u "$REAL_USER")}"
+REAL_GID="${SUDO_GID:-$(id -g "$REAL_USER")}"
 
-# --- GLOBAL VARIABLES & PATHS ---
-export WORKSPACE="./blindux"
-export MOUNT_ROOT="/mnt/blindux_root"
-export MOUNT_BOOT="/mnt/blindux_boot"
-export IMG_FS="${WORKSPACE}/blindux.fs.img"
-export IMG_BOOT="${WORKSPACE}/boot.dsk.img"
-export LOG_FILE="${WORKSPACE}/install.log"
-export STATE_FILE="${WORKSPACE}/.install_state.enc"
+# Global Runtime State Variables
+SELECTED_USB=""
+TARGET_IMG_PATH=""
+TARGET_SIZE_GB=""
+LUKS_PASSPHRASE=""
+BITLOCKER_KEY=""
+LOOP_DEV=""
 
-# --- COLOR PALETTE FOR PHASE LOGGING ---
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
-
-# ==============================================================================
-# UTILITY / HELPER FUNCTIONS
-# ==============================================================================
-
-log_phase() {
-    local phase="$1"
-    local desc="$2"
-    echo -e "\n${PURPLE}======================================================================${NC}" >&2
-    echo -e "${CYAN}[PHASE] ${phase}:${NC} ${desc}" >&2
-    echo -e "${PURPLE}======================================================================${NC}" >&2
-    echo "[PHASE] ${phase}: ${desc}" >> "${LOG_FILE}"
-}
-
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1" >&2
-    echo "[INFO] $1" >> "${LOG_FILE}"
-}
-
-log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1" >&2
-    echo "[SUCCESS] $1" >> "${LOG_FILE}"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1" >&2
-    echo "[ERROR] $1" >> "${LOG_FILE}"
-    exit 1
-}
-
-fix_ownership() {
-    local path="$1"
-    if [ -e "${path}" ]; then
-        chown -R "${REAL_UID}:${REAL_GID}" "${path}"
-    fi
-}
-
-# ==============================================================================
-# FASE 5: CLEANUP ROUTINE
-# ==============================================================================
-
+# --- CLEANUP TRAP HANDLER ---
 f5_cleanup() {
-    echo -e "\n${YELLOW}[CLEANUP] Intercepting exit state. Cleaning resources safely...${NC}"
-    set +e
-    
-    if [ -d "/mnt/vault" ]; then umount /mnt/vault 2>/dev/null; rm -rf /mnt/vault; fi
-    if cryptsetup status blindux_vault &>/dev/null; then cryptsetup close blindux_vault 2>/dev/null; fi
+    local exit_code=$?
+    echo -e "\n[!] Cleaning up environment and temporary mounts..."
 
-    umount -lf "${MOUNT_ROOT}/dev/pts" 2>/dev/null
-    umount -lf "${MOUNT_ROOT}/dev" 2>/dev/null
-    umount -lf "${MOUNT_ROOT}/proc" 2>/dev/null
-    umount -lf "${MOUNT_ROOT}/sys" 2>/dev/null
-    
-    umount -lf "${MOUNT_ROOT}" 2>/dev/null
-    umount -lf "${MOUNT_BOOT}" 2>/dev/null
+    # Unmount bind mounts in strict reverse order
+    if findmnt -M "${MOUNT_DIR}/mnt/usb_boot" >/dev/null 2>&1; then umount -lf "${MOUNT_DIR}/mnt/usb_boot" || true; fi
+    if findmnt -M "${MOUNT_DIR}/dev/pts" >/dev/null 2>&1; then umount -lf "${MOUNT_DIR}/dev/pts" || true; fi
+    if findmnt -M "${MOUNT_DIR}/dev" >/dev/null 2>&1; then umount -lf "${MOUNT_DIR}/dev" || true; fi
+    if findmnt -M "${MOUNT_DIR}/proc" >/dev/null 2>&1; then umount -lf "${MOUNT_DIR}/proc" || true; fi
+    if findmnt -M "${MOUNT_DIR}/sys" >/dev/null 2>&1; then umount -lf "${MOUNT_DIR}/sys" || true; fi
+    if findmnt -M "${MOUNT_DIR}" >/dev/null 2>&1; then umount -lf "${MOUNT_DIR}" || true; fi
+    if findmnt -M "${USB_MOUNT_DIR}" >/dev/null 2>&1; then umount -lf "${USB_MOUNT_DIR}" || true; fi
 
-    if [ -n "${BOOT_LOOP_DEV:-}" ] && losetup -a | grep -q "${BOOT_LOOP_DEV}"; then
-        losetup -d "${BOOT_LOOP_DEV}" 2>/dev/null
+    # Detach loop device if active
+    if [[ -n "${LOOP_DEV}" ]] && losetup "${LOOP_DEV}" >/dev/null 2>&1; then
+        losetup -d "${LOOP_DEV}" || true
     fi
-    
-    if [ -d "${WORKSPACE}" ]; then fix_ownership "${WORKSPACE}"; fi
-    set -e
-    echo -e "${GREEN}[CLEANUP] Workspace structural safety achieved.${NC}"
+
+    # Restore ownership of output files to host user
+    if [[ -d "${WORKSPACE_DIR}" ]]; then
+        chown -R "${REAL_UID}:${REAL_GID}" "${WORKSPACE_DIR}" || true
+    fi
+
+    if [[ $exit_code -ne 0 ]]; then
+        echo "[X] Installation aborted or failed with exit code $exit_code."
+    fi
+    exit $exit_code
 }
 
 trap f5_cleanup EXIT INT TERM
 
-# ==============================================================================
-# FASE 0: PRE-INSTALLATION, CONTEXT & STATE RESUME
-# ==============================================================================
-
-f0_initialize() {
-    clear
-    echo -e "${CYAN}--- Blindux Installer ---${NC}"
-    echo -e "${BLUE}[VERSION MASTER] Skeleton: ${SKELETON_VERSION} | Script: ${SCRIPT_VERSION}${NC}\n"
-    
-    mkdir -p "${WORKSPACE}"
-    touch "${LOG_FILE}"
-    fix_ownership "${WORKSPACE}"
-    log_info "Workspace verified with host user execution contexts. Version mapping complete."
+# --- HELPER FUNCTIONS ---
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "[X] Error: This script must be executed with root privileges (sudo)." >&2
+        exit 1
+    fi
 }
 
-f0_save_checkpoint() {
-    local current_phase="$1"
-    log_info "Saving checkpoint session state at Phase [${current_phase}]..."
-    
-    local raw_state
-    raw_state=$(cat <<EOF
-export CHECKPOINT="${current_phase}"
-export TARGET_USB="${TARGET_USB}"
-export TARGET_DISTRO="${TARGET_DISTRO}"
-export IMG_SIZE_GB="${IMG_SIZE_GB}"
-export BITLOCKER_KEY="${BITLOCKER_KEY}"
-export LUKS_PASS="${LUKS_PASS}"
-export LOGGED_SKELETON_VERSION="${SKELETON_VERSION}"
-export LOGGED_SCRIPT_VERSION="${SCRIPT_VERSION}"
-EOF
-)
-    echo "${raw_state}" | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -pass pass:"${LUKS_PASS}" -out "${STATE_FILE}"
-    fix_ownership "${STATE_FILE}"
+init_workspace() {
+    mkdir -p "${WORKSPACE_DIR}" "${BUILD_DIR}" "${MOUNT_DIR}" "${USB_MOUNT_DIR}"
+    chown -R "${REAL_UID}:${REAL_GID}" "${WORKSPACE_DIR}"
 }
 
-f0_check_resume() {
-    if [ -f "${STATE_FILE}" ]; then
-        echo -e "${YELLOW}[RESUME] An existing installation state file was found.${NC}"
-        while true; do
-            read -s -rp "Enter your Blindux Master Passphrase to unlock session: " pass_check
-            echo ""
-            if [ -z "${pass_check}" ]; then continue; fi
-            
-            if decrypted_env=$(openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass pass:"${pass_check}" -in "${STATE_FILE}" 2>/dev/null); then
-                eval "${decrypted_env}"
-                
-                log_info "State synchronization telemetry check:"
-                log_info "  -> Found session Skeleton: ${LOGGED_SKELETON_VERSION:-Unknown}"
-                log_info "  -> Found session Script: ${LOGGED_SCRIPT_VERSION:-Unknown}"
-                
-                log_success "Session decrypted. Resuming deployment flow from Phase [${CHECKPOINT}]."
-                return 0
-            else
-                echo -e "${RED}Invalid Master Passphrase. Decryption failed.${NC}"
-                read -rp "Do you want to discard this session and start over? (y/N): " restart_choice
-                if [[ "$restart_choice" =~ ^[yY]$ ]]; then
-                    rm -f "${STATE_FILE}"
-                    log_info "Previous state removed. Proceeding with fresh configuration."
-                    break
-                fi
+# --- PHASE 0: INTERACTIVE INPUT GATHERING ---
+phase0_input_gathering() {
+    echo "=================================================================="
+    echo "--- Blindux Installer (v${SCRIPT_VERSION} / Skeleton v${SKELETON_VERSION}) ---"
+    echo "=================================================================="
+
+    # 1. Target USB Selector
+    while true; do
+        echo -e "\n[?] Scanning available USB block devices..."
+        
+        local usb_list=()
+        local usb_devices=()
+
+        local raw_lsblk
+        raw_lsblk=$(lsblk -dn -o NAME,SIZE,TYPE,TRAN,LABEL,FSTYPE | grep -E 'usb|disk' || true)
+
+        local count=1
+        while read -r line; do
+            if [[ -n "$line" ]]; then
+                usb_list+=("$line")
+                local dev_name
+                dev_name=$(echo "$line" | awk '{print $1}')
+                usb_devices+=("/dev/${dev_name}")
+                echo "  ${count}) /dev/${dev_name} - ${line}"
+                ((count++))
             fi
-        done
-    fi
-    export CHECKPOINT="0"
-}
+        done <<< "$raw_lsblk"
 
-f0_select_usb() {
-    if [ "${CHECKPOINT}" != "0" ]; then return 0; fi
-    log_phase "0.2" "Scanning for target USB devices..."
-    echo -e "Available block storage tracks:"
-    
-    local devices
-    mapfile -t devices < <(lsblk -dno NAME,SIZE,TYPE,TRAN | grep "usb" || true)
-    
-    echo "----------------------------------------------------------"
-    lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINTS
-    echo "----------------------------------------------------------"
-    echo "0) None (Build image files in workspace only, do not flash)"
-    
-    local idx=1 dev_map=()
-    for dev in "${devices[@]}"; do
-        local name size
-        name=$(echo "$dev" | awk '{print $1}')
-        size=$(echo "$dev" | awk '{print $2}')
-        echo "$idx) /dev/$name ($size)"
-        dev_map+=("/dev/$name")
-        idx=$((idx + 1))
-    done
+        if [[ ${#usb_list[@]} -eq 0 ]]; then
+            echo "  [!] No USB or disk devices found automatically."
+        fi
 
-    local choice
-    while true; do
-        read -rp "Select target boot USB device (0-${#dev_map[@]}): " choice
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -le "${#dev_map[@]}" ]; then break; fi
-        echo "Invalid choice. Please retry."
-    done
+        echo "  r) [Refresh Device List]"
+        read -rp "Select target USB device (1-${#usb_list[@]} or 'r'): " usb_choice
 
-    if [ "$choice" -eq 0 ]; then
-        export TARGET_USB="None"
-    else
-        export TARGET_USB="${dev_map[$((choice - 1))]}"
-    fi
-    log_info "Target boot USB set to: ${TARGET_USB}"
-}
-
-f0_select_distro() {
-    if [ "${CHECKPOINT}" != "0" ]; then return 0; fi
-    log_phase "0.3" "Select Base Linux Distribution"
-    echo "1) Arch Linux"
-    echo "2) Debian Stable"
-    echo "3) Fedora (DNF InstallRoot)"
-    
-    local choice
-    while true; do
-        read -rp "Select base distribution (1-3): " choice
-        case "$choice" in
-            1) export TARGET_DISTRO="arch"; break;;
-            2) export TARGET_DISTRO="debian"; break;;
-            3) export TARGET_DISTRO="fedora"; break;;
-            *) echo "Invalid selection.";;
-        esac
-    done
-    log_info "Target distribution set to: ${TARGET_DISTRO}"
-}
-
-f0_select_size() {
-    if [ "${CHECKPOINT}" != "0" ]; then return 0; fi
-    log_phase "0.4" "Allocate Virtual Disk Capacity"
-    
-    local host_free_kb host_free_gb
-    host_free_kb=$(df --output=avail . | tail -n1)
-    host_free_gb=$(( host_free_kb / 1024 / 1024 ))
-
-    while true; do
-        read -rp "Enter initial image size in GB [Default: 10]: " size_input
-        if [ -z "${size_input}" ]; then size_input="10"; fi
-        
-        if [[ ! "${size_input}" =~ ^[0-9]+$ ]] || [ "${size_input}" -eq 0 ]; then
-            echo -e "${RED}Error: Size must be a valid positive integer greater than 0.${NC}"
+        if [[ "$usb_choice" == "r" || "$usb_choice" == "R" ]]; then
             continue
-        fi
-
-        if [ "${size_input}" -ge "${host_free_gb}" ]; then
-            echo -e "${RED}Insufficient disk space. Only ${host_free_gb}GB available on host directory path.${NC}"
-            continue
-        fi
-        
-        export IMG_SIZE_GB="${size_input}"
-        break
-    done
-    log_info "System image targeted volume constraint: ${IMG_SIZE_GB} GB."
-}
-
-f0_gather_keys() {
-    if [ "${CHECKPOINT}" != "0" ]; then return 0; fi
-    log_phase "0.5" "Defining Credentials Schema"
-    
-    while true; do
-        read -s -rp "Define Blindux Master LUKS Passphrase: " LUKS_PASS
-        echo ""
-        read -s -rp "Confirm Master LUKS Passphrase: " LUKS_PASS_CONFIRM
-        echo ""
-        if [ "$LUKS_PASS" = "$LUKS_PASS_CONFIRM" ] && [ -n "$LUKS_PASS" ]; then
-            export LUKS_PASS
-            log_success "Master Passphrase mapped successfully."
-            break
-        fi
-        echo -e "${RED}Passwords do not match or are empty. Retry.${NC}"
-    done
-
-    while true; do
-        read -s -rp "Enter Windows BitLocker Recovery Key (Leave EMPTY if unencrypted): " BITLOCKER_KEY
-        echo ""
-        if [ -z "$BITLOCKER_KEY" ]; then
-            export BITLOCKER_KEY=""
-            log_info "No encryption payload bound to corporate environment host partition."
+        elif [[ "$usb_choice" =~ ^[0-9]+$ ]] && (( usb_choice >= 1 && usb_choice <= ${#usb_list[@]} )); then
+            SELECTED_USB="${usb_devices[$((usb_choice-1))]}"
+            echo "[+] Selected USB Target: ${SELECTED_USB}"
             break
         else
-            if [[ "$BITLOCKER_KEY" =~ ^([0-9]{6}-?){8}$ ]]; then
-                export BITLOCKER_KEY="$BITLOCKER_KEY"
-                log_success "BitLocker token regex signature validated."
-                break
-            else
-                echo -e "${YELLOW}Warning: Non-standard BitLocker core layout detected.${NC}"
-                read -rp "Enforce integration anyway? (y/N): " confirm
-                if [[ "$confirm" =~ ^[yY]$ ]]; then
-                    export BITLOCKER_KEY="$BITLOCKER_KEY"
-                    break
-                fi
-            fi
+            echo "[!] Invalid selection. Please try again."
         fi
     done
-    
-    f0_save_checkpoint "1"
-}
 
-# ==============================================================================
-# FASE 1: IMAGE PROVISIONING & STRAPPED INSTALLATION
-# ==============================================================================
+    # 2. Target Image Path Selector
+    echo -e "\n[?] Select destination path for blindux.fs.img on host NTFS volume:"
+    echo "  1) /blindux/blindux.fs.img (Default)"
+    echo "  2) /Users/Public/blindux/blindux.fs.img"
+    echo "  3) Custom path"
+    read -rp "Choice [1-3] (Default: 1): " path_choice
+    path_choice="${path_choice:-1}"
 
-f1_create_system_image() {
-    if [ "${CHECKPOINT}" -gt "1" ]; then return 0; fi
-    log_phase "1.1" "Provisioning virtual system storage"
-    
-    if [ -f "${IMG_FS}" ]; then
-        log_info "Removing stale image from previous interrupted workspace run..."
-        rm -f "${IMG_FS}"
-    fi
-
-    log_info "Allocating raw sparse file boundary (${IMG_SIZE_GB}GB) at ${IMG_FS}..."
-    truncate -s "${IMG_SIZE_GB}G" "${IMG_FS}"
-    fix_ownership "${IMG_FS}"
-
-    log_info "Structuring active standalone target loop filesystem layer directly..."
-    mkfs.ext4 -F -O "^metadata_csum,^64bit" "${IMG_FS}"
-    log_success "Storage layer instantiated."
-}
-
-f1_bootstrap_os() {
-    if [ "${CHECKPOINT}" -gt "1" ]; then return 0; fi
-    log_phase "1.2" "Bootstrapping Target Operating System Base"
-    mkdir -p "${MOUNT_ROOT}"
-    
-    log_info "Mounting loopback image system channel..."
-    mount -o loop "${IMG_FS}" "${MOUNT_ROOT}"
-
-    log_info "Deploying target base architecture binary structures (${TARGET_DISTRO})..."
-    case "${TARGET_DISTRO}" in
-        "arch")
-            if ! command -v pacstrap &>/dev/null; then
-                log_error "pacstrap missing. Install 'arch-install-scripts' utility on host environment."
+    case "$path_choice" in
+        1) TARGET_IMG_PATH="/blindux/blindux.fs.img" ;;
+        2) TARGET_IMG_PATH="/Users/Public/blindux/blindux.fs.img" ;;
+        3) 
+            read -rp "Enter absolute custom path (e.g., /MyOS/blindux.fs.img): " custom_path
+            if [[ "$custom_path" != /* ]]; then
+                custom_path="/${custom_path}"
             fi
+            TARGET_IMG_PATH="${custom_path}"
+            ;;
+        *) TARGET_IMG_PATH="/blindux/blindux.fs.img" ;;
+    esac
+    echo "[+] Target Image Path: ${TARGET_IMG_PATH}"
 
-            log_info "Generating pure Arch Linux mirrors and configuration matrices..."
-            local tmp_mirrors="${WORKSPACE}/mirrors_pure_arch.conf"
-            cat <<EOF > "${tmp_mirrors}"
-Server = https://geo.mirror.pkgbuild.com/\$repo/os/\$arch
-Server = https://mirror.rackspace.com/archlinux/\$repo/os/\$arch
-EOF
+    # 3. Image Size Picker
+    local avail_space_gb
+    avail_space_gb=$(df -BG . | tail -n1 | awk '{print $4}' | sed 's/G//')
 
-            local tmp_pacman="${WORKSPACE}/pacman_pure_arch.conf"
-            cat <<EOF > "${tmp_pacman}"
+    while true; do
+        read -rp $'\n[?] Enter target container size in GB [Default: 20]: ' input_size
+        input_size="${input_size:-20}"
+
+        if [[ "$input_size" =~ ^[1-9][0-9]*$ ]]; then
+            if (( input_size > avail_space_gb )); then
+                echo "[!] Error: Requested ${input_size}GB, but host only has ${avail_space_gb}GB available."
+            else
+                TARGET_SIZE_GB="$input_size"
+                echo "[+] Target Image Size set to: ${TARGET_SIZE_GB} GB"
+                break
+            fi
+        else
+            echo "[!] Invalid input. Must be a non-zero positive integer."
+        fi
+    done
+
+    # 4. Master Passphrase Input
+    while true; do
+        read -rsp $'\n[?] Define Master Passphrase (LUKS/Key Storage): ' pass1
+        echo
+        read -rsp "[?] Confirm Master Passphrase: " pass2
+        echo
+        if [[ -n "$pass1" && "$pass1" == "$pass2" ]]; then
+            LUKS_PASSPHRASE="$pass1"
+            break
+        else
+            echo "[!] Passphrases do not match or are empty. Try again."
+        fi
+    done
+
+    # 5. BitLocker Recovery Key Input
+    read -rsp $'\n[?] Enter Windows BitLocker Recovery Key (Leave empty if unencrypted): ' BITLOCKER_KEY
+    echo
+    if [[ -n "$BITLOCKER_KEY" ]]; then
+        echo "[+] BitLocker Recovery Key registered."
+    else
+        echo "[*] No BitLocker Key provided. Proceeding assuming unencrypted host partition."
+    fi
+}
+
+# --- PHASE 1: TEMPLATE IMAGE PROVISIONING & STRAPPED INSTALLATION ---
+phase1_provisioning() {
+    echo -e "\n=================================================================="
+    echo "--- PHASE 1: Sparse Template Allocation & Arch Linux Bootstrap ---"
+    echo "=================================================================="
+
+    echo "[+] Creating 3GB sparse RAW template image at ${TEMPLATE_IMG}..."
+    truncate -s 3G "${TEMPLATE_IMG}"
+    chown "${REAL_UID}:${REAL_GID}" "${TEMPLATE_IMG}"
+
+    echo "[+] Formatting template image with ext4..."
+    mkfs.ext4 -F -q "${TEMPLATE_IMG}"
+
+    echo "[+] Mounting template image to ${MOUNT_DIR}..."
+    mount -o loop "${TEMPLATE_IMG}" "${MOUNT_DIR}"
+    LOOP_DEV=$(findmnt -n -o SOURCE "${MOUNT_DIR}" || true)
+
+    echo "[+] Setting up isolated Arch Linux repository configuration..."
+    local tmp_pacman_conf="${BUILD_DIR}/pacman.conf"
+    local tmp_mirrorlist="${BUILD_DIR}/mirrorlist"
+    local tmp_gpg_dir="${BUILD_DIR}/gnupg"
+
+    echo "Server = https://geo.mirror.pkgbuild.com/\$repo/os/\$arch" > "${tmp_mirrorlist}"
+    
+    mkdir -p "${tmp_gpg_dir}"
+    chmod 700 "${tmp_gpg_dir}"
+    
+    echo "[+] Initializing isolated Arch Linux keyring..."
+    pacman-key --gpgdir "${tmp_gpg_dir}" --init
+    pacman-key --gpgdir "${tmp_gpg_dir}" --populate archlinux
+
+    cat <<EOF > "${tmp_pacman_conf}"
 [options]
+HoldPkg     = pacman glibc
 Architecture = auto
-SigLevel = Required DatabaseOptional TrustedOnly
+SigLevel    = Required DatabaseOptional
 LocalFileSigLevel = Optional
+GPGDir      = ${tmp_gpg_dir}
+Include     = ${tmp_mirrorlist}
 
 [core]
-Include = ${tmp_mirrors}
+Include = ${tmp_mirrorlist}
 
 [extra]
-Include = ${tmp_mirrors}
+Include = ${tmp_mirrorlist}
 EOF
 
-            log_info "Bootstrapping pure Arch Linux matrix using isolated configuration profile..."
-            pacstrap -C "${tmp_pacman}" -K "${MOUNT_ROOT}" \
-                base linux linux-firmware base-devel ntfs-3g fuse2 \
-                cryptsetup systemd-sysvcompat grub-efi-x86_64 python networkmanager --noconfirm
-            
-            rm -f "${tmp_pacman}" "${tmp_mirrors}"
-            ;;
-        "debian")
-            if ! command -v debootstrap &>/dev/null; then log_error "debootstrap package missing on host."; fi
-            debootstrap stable "${MOUNT_ROOT}" http://deb.debian.org/debian/
-            ;;
-        "fedora")
-            if ! command -v dnf &>/dev/null; then log_error "dnf core framework tracking missing."; fi
-            dnf -y --installroot="${MOUNT_ROOT}" --releasever=44 groupinstall "Minimal Install"
-            dnf -y --installroot="${MOUNT_ROOT}" install kernel grub2-efi-x64 ntfs-3g cryptsetup fuse NetworkManager
-            ;;
-    esac
-    log_success "Base runtime OS deployment sequence completed."
+    echo "[+] Executing pacstrap with core base packages and compilation tools..."
+    pacstrap -C "${tmp_pacman_conf}" -c "${MOUNT_DIR}" \
+        base linux linux-firmware base-devel grub efibootmgr \
+        archlinux-keyring ntfs-3g cryptsetup git cmake mbedtls fuse2 \
+        patch util-linux e2fsprogs coreutils which parted --noconfirm
+
+    # Mount system descriptors for chroot operations
+    echo "[+] Binding system descriptors (/dev, /dev/pts, /proc, /sys)..."
+    mount --bind /dev "${MOUNT_DIR}/dev"
+    mount --bind /dev/pts "${MOUNT_DIR}/dev/pts"
+    mount --bind /proc "${MOUNT_DIR}/proc"
+    mount --bind /sys "${MOUNT_DIR}/sys"
+
+    # Copy Host DNS configuration to guarantee network access inside chroot
+    echo "[+] Copying host DNS resolution settings..."
+    cp -L /etc/resolv.conf "${MOUNT_DIR}/etc/resolv.conf" 2>/dev/null || true
+
+    # Prevent vconsole warnings in mkinitcpio
+    echo "KEYMAP=us" > "${MOUNT_DIR}/etc/vconsole.conf"
+
+    echo "[+] Populating keyrings and generating locales inside target chroot..."
+    sed -i 's/#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' "${MOUNT_DIR}/etc/locale.gen" 2>/dev/null || true
+    echo "LANG=en_US.UTF-8" > "${MOUNT_DIR}/etc/locale.conf"
+    chroot "${MOUNT_DIR}" locale-gen || true
+
+    chroot "${MOUNT_DIR}" env LC_ALL=C pacman-key --init
+    chroot "${MOUNT_DIR}" env LC_ALL=C pacman-key --populate archlinux
+
+    echo "[+] Configuring system clock inside chroot..."
+    chroot "${MOUNT_DIR}" env LC_ALL=C hwclock --systohc --localtime || true
+
+    # Compile and install dislocker from source inside chroot
+    echo "[+] Building and installing dislocker from upstream source inside chroot..."
+    chroot "${MOUNT_DIR}" /bin/bash -c "
+        rm -rf /tmp/dislocker-src && \
+        git clone https://github.com/Aorimn/dislocker.git /tmp/dislocker-src && \
+        cd /tmp/dislocker-src && \
+        cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr && \
+        make -C build -j\$(nproc) && \
+        make -C build install && \
+        rm -rf /tmp/dislocker-src
+    "
+
+    # Clean up build-only packages and package caches to maximize available user space
+    echo "[+] Cleaning up build dependencies and package caches..."
+    chroot "${MOUNT_DIR}" /bin/bash -c "
+        pacman -Rns --noconfirm cmake git 2>/dev/null || true
+        pacman -Scc --noconfirm
+        rm -rf /tmp/* /var/tmp/* /var/cache/pacman/pkg/*
+    "
+
+    mkdir -p "${MOUNT_DIR}/boot"
 }
 
-f1_configure_chroot() {
-    if [ "${CHECKPOINT}" -gt "1" ]; then return 0; fi
-    log_phase "1.3" "Executing Embedded Chroot Localization & Basic Provisioning"
-    
-    mount --bind /dev "${MOUNT_ROOT}/dev"
-    mount --bind /dev/pts "${MOUNT_ROOT}/dev/pts"
-    mount --bind /proc "${MOUNT_ROOT}/proc"
-    mount --bind /sys "${MOUNT_ROOT}/sys"
-    
-    cp -L /etc/resolv.conf "${MOUNT_ROOT}/etc/resolv.conf" 2>/dev/null || true
+# --- PHASE 2: BOOT USB & 2-PARTITION LAYOUT GENERATION ---
+phase2_usb_layout() {
+    echo -e "\n=================================================================="
+    echo "--- PHASE 2: USB Partitioning & Boot Volume Provisioning ---"
+    echo "=================================================================="
 
-    log_info "Applying virtualization core parameters and host clock co-existence layers..."
-    cat <<EOF | chroot "${MOUNT_ROOT}" /bin/bash
-    echo "blindux" > /etc/hostname
-    echo "127.0.0.1 localhost" >> /etc/hosts
-    echo "::1       localhost" >> /etc/hosts
-    if [ -f /etc/locale.gen ]; then
-        echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
-        locale-gen &>/dev/null
+    echo "[!] WARNING: All data on ${SELECTED_USB} will be wiped!"
+    read -rp "Are you sure you want to proceed? [y/N]: " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo "[X] USB provisioning aborted."
+        exit 1
     fi
-    echo "LANG=en_US.UTF-8" > /etc/locale.conf
-    echo "KEYMAP=us" > /etc/vconsole.conf
-    hwclock --systohc --localtime
-EOF
 
-    log_info "Enabling core networking frameworks inside target environments non-interactively..."
-    case "${TARGET_DISTRO}" in
-        "arch"|"fedora")
-            cat <<EOF | chroot "${MOUNT_ROOT}" /bin/bash
-            systemctl enable NetworkManager &>/dev/null || true
-EOF
-            ;;
-        "debian")
-            cat <<EOF | chroot "${MOUNT_ROOT}" /bin/bash
-            apt-get update -y &>/dev/null
-            apt-get install -y network-manager &>/dev/null
-            systemctl enable network-manager &>/dev/null || true
-EOF
-            ;;
-    esac
+    # Unmount target USB if already mounted
+    umount "${SELECTED_USB}"* 2>/dev/null || true
 
-    log_success "Chroot profiling and localization requirements synchronized successfully."
-}
-
-f1_optimize_compression() {
-    if [ "${CHECKPOINT}" -gt "1" ]; then return 0; fi
-    log_phase "1.4" "Optimizing Disk Blocks for Maximal Compression (Zero-Filling)"
+    echo "[+] Creating GPT partition table on ${SELECTED_USB}..."
+    parted -s "${SELECTED_USB}" mklabel gpt
     
-    log_info "Writing binary zeros (throttled sync to prevent system freeze)..."
-    dd if=/dev/zero of="${MOUNT_ROOT}/zero.tmp" bs=4M status=progress conv=fdatasync || true
-    
-    log_info "Purging dummy zero allocations file..."
-    rm -f "${MOUNT_ROOT}/zero.tmp"
+    # Partition 1: FAT32 Data Volume (Rest of disk)
+    # Partition 2: FAT32 Boot/EFI Volume (~4GB at the end)
+    echo "[+] Creating 2-partition scheme (Data & Unified EFI/Boot)..."
+    parted -s "${SELECTED_USB}" -- mkpart primary fat32 1MiB -4096MiB
+    parted -s "${SELECTED_USB}" -- mkpart primary fat32 -4096MiB 100%
+    parted -s "${SELECTED_USB}" set 2 esp on
+
+    # Sync partition table with the kernel
+    partprobe "${SELECTED_USB}" || true
+    udevadm settle || sleep 2
+
+    # Format Partitions
+    local p1="${SELECTED_USB}1"
+    local p2="${SELECTED_USB}2"
+
+    if [[ "${SELECTED_USB}" == *"nvme"* || "${SELECTED_USB}" == *"loop"* ]]; then
+        p1="${SELECTED_USB}p1"
+        p2="${SELECTED_USB}p2"
+    fi
+
+    echo "[+] Formatting ${p1} as FAT32 (Data)..."
+    mkfs.vfat -F32 -n "BLNDX_DATA" "${p1}"
+
+    echo "[+] Formatting ${p2} as FAT32 (Boot/EFI)..."
+    mkfs.vfat -F32 -n "BLNDX_BOOT" "${p2}"
+
+    # Ensure filesystems are written and block devices are ready
     sync
-    
-    log_info "Dismantling chroot inner binds before system unmount..."
-    umount -lf "${MOUNT_ROOT}/dev/pts" 2>/dev/null || true
-    umount -lf "${MOUNT_ROOT}/dev" 2>/dev/null || true
-    umount -lf "${MOUNT_ROOT}/proc" 2>/dev/null || true
-    umount -lf "${MOUNT_ROOT}/sys" 2>/dev/null || true
-    umount -lf "${MOUNT_ROOT}" 2>/dev/null || true
-    sync
-    
-    f0_save_checkpoint "2"
-}
+    udevadm settle || sleep 2
 
-# ==============================================================================
-# FASE 2: BOOT IMAGE GENERATION (`boot.dsk.img`)
-# ==============================================================================
+    echo "[+] Mounting ${p2} to ${USB_MOUNT_DIR}..."
+    mount "${p2}" "${USB_MOUNT_DIR}"
 
-f2_create_boot_disk() {
-    if [ "${CHECKPOINT}" -gt "2" ]; then return 0; fi
-    log_phase "2.1" "Generating boot disk image (boot.dsk.img)"
-    
-    truncate -s 256M "${IMG_BOOT}"
-    fix_ownership "${IMG_BOOT}"
-    
-    parted -s "${IMG_BOOT}" mklabel gpt
-    parted -s "${IMG_BOOT}" mkpart ESP fat32 1MiB 100%
-    parted -s "${IMG_BOOT}" set 1 esp on
-
-    export BOOT_LOOP_DEV
-    BOOT_LOOP_DEV=$(losetup -fP --show "${IMG_BOOT}")
-    local part_dev="${BOOT_LOOP_DEV}p1"
-
-    mkfs.vfat -F 32 -n "BL_BOOT" "${part_dev}"
-    export USB_BOOT_UUID
-    USB_BOOT_UUID=$(blkid -s UUID -o value "${part_dev}")
-
-    mkdir -p "${MOUNT_BOOT}"
-    mount "${part_dev}" "${MOUNT_BOOT}"
-
-    log_info "Deploying portable standalone EFI GRUB payload..."
-    grub-install --target=x86_64-efi --efi-directory="${MOUNT_BOOT}" --boot-directory="${MOUNT_BOOT}" --removable --recheck
-}
-
-f2_secure_bitlocker_key() {
-    if [ "${CHECKPOINT}" -gt "2" ]; then return 0; fi
-    
-    if [ -n "${BITLOCKER_KEY}" ]; then
-        log_phase "2.2" "Deploying Corporate Keys into Strict 32MB LUKS2 Vault"
-        local luks_file="${MOUNT_BOOT}/keys.luks"
+    # Handle BitLocker Key Encryption (keys.luks)
+    if [[ -n "$BITLOCKER_KEY" ]]; then
+        echo "[+] Securing BitLocker Recovery Key inside LUKS2 container..."
+        local luks_file="${USB_MOUNT_DIR}/keys.luks"
+        truncate -s 32M "${luks_file}"
         
-        dd if=/dev/zero of="${luks_file}" bs=1M count=32
+        echo -n "$LUKS_PASSPHRASE" | cryptsetup luksFormat --type luks2 --batch-mode "${luks_file}" -
         
-        log_info "Formatting LUKS2 array structure with master credential passphrase..."
-        echo -n "${LUKS_PASS}" | cryptsetup luksFormat --type luks2 "${luks_file}" -
-        
-        log_info "Injecting Windows keys payloads..."
-        echo -n "${LUKS_PASS}" | cryptsetup open "${luks_file}" blindux_vault -
-        
-        mkdir -p /mnt/vault
-        mkfs.ext2 -F /dev/mapper/blindux_vault &>/dev/null
-        mount /dev/mapper/blindux_vault /mnt/vault
-        echo -n "${BITLOCKER_KEY}" > /mnt/vault/bitlocker.key
-        
-        umount /mnt/vault
-        cryptsetup close blindux_vault
-        rm -rf /mnt/vault
-        log_success "BitLocker corporate unlock sequence payload successfully secured."
-    else
-        log_info "Host unencrypted tracking profile requested. Omit LUKS container layer allocation."
+        # Temporary map to write key
+        echo -n "$LUKS_PASSPHRASE" | cryptsetup open "${luks_file}" blindux_keys -
+        mkfs.ext4 -F -q /dev/mapper/blindux_keys
+        mkdir -p /mnt/keys_tmp
+        mount /dev/mapper/blindux_keys /mnt/keys_tmp
+        echo "$BITLOCKER_KEY" > /mnt/keys_tmp/bitlocker.key
+        sync
+        umount /mnt/keys_tmp
+        cryptsetup close blindux_keys
+        rmdir /mnt/keys_tmp
     fi
-    
-    f0_save_checkpoint "3"
+
+    # Copy template image to USB /boot
+    echo "[+] Copying template image to USB Boot Partition..."
+    cp "${TEMPLATE_IMG}" "${USB_MOUNT_DIR}/blindux.fs.img"
 }
 
-# ==============================================================================
-# FASE 3: BOOTLOADER & CUSTOM INITRAMFS CONFIGURATION
-# ==============================================================================
+# --- PHASE 3: BOOTLOADER, ISOLATED CHROOT INSTALLED GRUB & INITRAMFS ---
+phase3_bootloader_initramfs() {
+    echo -e "\n=================================================================="
+    echo "--- PHASE 3: GRUB Setup, Initramfs Custom Hook & Boot Logic ---"
+    echo "=================================================================="
 
-f3_configure_bootloader() {
-    if [ "${CHECKPOINT}" -gt "3" ]; then return 0; fi
-    log_phase "3.1" "Writing Embedded Hardware Agnostic Architecture Assets"
+    local p2_uuid
+    p2_uuid=$(blkid -s UUID -o value "$(df "${USB_MOUNT_DIR}" | tail -n1 | awk '{print $1}')")
 
-    if ! findmnt -nt ext4 "${MOUNT_ROOT}" >/dev/null; then
-        log_info "Mounting loopback image system channel..."
-        mount -o loop "${IMG_FS}" "${MOUNT_ROOT}"
-    else
-        log_info "Image already mapped at target mount point. Reusing active descriptor."
-    fi
-    
-    mkdir -p "${MOUNT_ROOT}/etc"
-    cat <<EOF > "${MOUNT_ROOT}/etc/fstab"
-# Embedded Blindux Host USB Boot Mount Profile
-UUID=${USB_BOOT_UUID}   /boot   vfat   noauto,nofail,defaults   0   2
+    # Write embedded /etc/fstab inside image
+    cat <<EOF > "${MOUNT_DIR}/etc/fstab"
+UUID=${p2_uuid}   /boot   vfat   noauto,nofail,defaults   0   2
 EOF
 
-    if [ -f "${MOUNT_ROOT}/etc/mkinitcpio.conf" ]; then
-        sed -i 's/^FILES=(.*)/FILES=(\/etc\/fstab)/' "${MOUNT_ROOT}/etc/mkinitcpio.conf"
-    fi
+    # Install GRUB Portable EFI strictly via CHROOT (Bind-Mount approach to preserve Host)
+    echo "[+] Bind-mounting USB boot partition inside chroot for isolated GRUB installation..."
+    mkdir -p "${MOUNT_DIR}/mnt/usb_boot"
+    mount --bind "${USB_MOUNT_DIR}" "${MOUNT_DIR}/mnt/usb_boot"
 
-    log_info "Generating GRUB environment configurations..."
-    cat <<EOF > "${MOUNT_BOOT}/grub/grub.cfg"
+    echo "[+] Installing Portable GRUB2 EFI payload strictly using target chroot binaries..."
+    chroot "${MOUNT_DIR}" grub-install \
+        --target=x86_64-efi \
+        --efi-directory=/mnt/usb_boot \
+        --boot-directory=/mnt/usb_boot/boot \
+        --bootloader-id="BOOT" \
+        --removable \
+        --recheck
+
+    # Unmount bind mount immediately after installation
+    umount "${MOUNT_DIR}/mnt/usb_boot"
+    rmdir "${MOUNT_DIR}/mnt/usb_boot"
+
+    # Write grub.cfg with root=auto transient parameter
+    echo "[+] Configuring grub.cfg with root=auto transient discovery parameter..."
+    mkdir -p "${USB_MOUNT_DIR}/boot/grub"
+    cat <<EOF > "${USB_MOUNT_DIR}/boot/grub/grub.cfg"
 set default=0
-set timeout=3
+set timeout=5
 
-menuentry "Blindux Native Security OS" {
-    insmod ext2
+menuentry "Blindux Portable OS" {
     insmod fat
-    search --no-floppy --fs-uuid --set=root ${USB_BOOT_UUID}
-    linux /vmlinuz-linux root=UUID=PLACE_HOLDER_WINDOWS_UUID root.img=/blindux/blindux.fs.img rw quiet
+    insmod ext2
+    insmod part_gpt
+    
+    search --no-floppy --fs-uuid --set=root ${p2_uuid}
+    
+    echo "Loading Linux Kernel..."
+    linux /vmlinuz-linux root=auto root.img=${TARGET_IMG_PATH} target.size=${TARGET_SIZE_GB} rw quiet
+    
+    echo "Loading Initramfs..."
     initrd /initramfs-linux.img
 }
 EOF
-}
 
-f3_generate_initramfs_hooks() {
-    if [ "${CHECKPOINT}" -gt "3" ]; then return 0; fi
-    log_phase "3.2" "Compiling Adaptive Initramfs Hook Arrays"
-
-    local hook_dir="${MOUNT_ROOT}/etc/initcpio"
-    mkdir -p "${hook_dir}/hooks" "${hook_dir}/install"
-
-    cat <<'EOF' > "${hook_dir}/install/blindux"
-#!/bin/bash
-build() {
-    add_runscript
-    add_binary cryptsetup
-    add_binary dislocker
-    add_binary ntfs-3g
-    add_module loop
-    add_module fuse
-}
-EOF
-    chmod +x "${hook_dir}/install/blindux"
-
-    cat <<'EOF' > "${hook_dir}/hooks/blindux"
-#!/usr/bin/env ash
+    # Copy Kernel & Initramfs binaries from chroot to USB
+    echo "[+] Synchronizing Kernel assets to USB..."
+    cp "${MOUNT_DIR}/boot/vmlinuz-linux" "${USB_MOUNT_DIR}/vmlinuz-linux" || cp "${MOUNT_DIR}/boot/vmlinuz"* "${USB_MOUNT_DIR}/vmlinuz-linux"
+    
+    # Generate Custom Initramfs Hook for Auto-Detection and BitLocker / NTFS Mounting
+    mkdir -p "${MOUNT_DIR}/etc/initcpio/hooks" "${MOUNT_DIR}/etc/initcpio/install"
+    
+    cat <<'EOF' > "${MOUNT_DIR}/etc/initcpio/hooks/blindux"
 run_hook() {
-    local host_root="" host_img=""
-    for param in $(cat /proc/cmdline); do
-        case ${param} in
-            root=*) host_root="${param#root=}" ;;
-            root.img=*) host_img="${param#root.img=}" ;;
+    echo "=== Blindux Smart Boot Initialization ==="
+    
+    ROOT_ARG=""
+    ROOT_IMG="/blindux/blindux.fs.img"
+    TARGET_SIZE="20"
+    
+    # Read command line arguments
+    for arg in $(cat /proc/cmdline); do
+        case "$arg" in
+            root=*) ROOT_ARG="${arg#*=}" ;;
+            root.img=*) ROOT_IMG="${arg#*=}" ;;
+            target.size=*) TARGET_SIZE="${arg#*=}" ;;
         esac
     done
 
-    echo ":: Blindux Initialization Vectors online..."
-    mkdir -p /boot
-    if ! mount /boot; then return 1; fi
+    if [ "$ROOT_ARG" = "auto" ]; then
+        echo "[+] Automated Smart Storage Discovery engaged."
+        
+        # Load necessary kernel drivers
+        modprobe fuse 2>/dev/null || true
+        modprobe loop 2>/dev/null || true
+        modprobe ext4 2>/dev/null || true
+        modprobe vfat 2>/dev/null || true
+        
+        # Mount the USB boot partition to access keys.luks and template
+        mkdir -p /boot
+        USB_BOOT_DEV=$(blkid -t LABEL="BLNDX_BOOT" -o device | head -n1)
+        if [ -n "$USB_BOOT_DEV" ]; then
+            mount -t vfat "$USB_BOOT_DEV" /boot 2>/dev/null || mount "$USB_BOOT_DEV" /boot 2>/dev/null || true
+        fi
 
-    if [ -f /boot/keys.luks ]; then
-        echo ":: Encrypted Windows corporate context detected."
-        local pass_verified=0
-        while [ ${pass_verified} -eq 0 ]; do
-            echo -n "Enter Blindux Master Passphrase: "
-            read -s pass; echo ""
-            if echo -n "${pass}" | cryptsetup open /boot/keys.luks blindux_vault -; then
-                pass_verified=1
+        mkdir -p /mnt/host
+
+        # Branch 1: BitLocker workflow if keys.luks exists
+        if [ -f /boot/keys.luks ]; then
+            echo "[+] Encrypted BitLocker key container detected (/boot/keys.luks)."
+            mkdir -p /mnt/keys /mnt/dislocker
+            
+            echo "[?] Enter Blindux Master Passphrase to unlock BitLocker key:"
+            if cryptsetup open /boot/keys.luks blindux_keys; then
+                mount /dev/mapper/blindux_keys /mnt/keys
+                BITLOCKER_KEY=$(cat /mnt/keys/bitlocker.key 2>/dev/null || true)
+                umount /mnt/keys
+                cryptsetup close blindux_keys
+                
+                # Scan for BitLocker partitions
+                BITLOCKER_DEVS=$(blkid -t TYPE=BitLocker -o device)
+                if [ -z "$BITLOCKER_DEVS" ]; then
+                    BITLOCKER_DEVS=$(lsblk -dpno NAME,TYPE | grep 'part' | awk '{print $1}')
+                fi
+                
+                DISLOCKER_SUCCESS=0
+                for bdev in $BITLOCKER_DEVS; do
+                    echo "[*] Attempting BitLocker unlock on $bdev..."
+                    if dislocker -V "$bdev" -p"$BITLOCKER_KEY" -- /mnt/dislocker 2>/dev/null; then
+                        echo "[+] BitLocker volume unlocked successfully on $bdev."
+                        if ntfs-3g /mnt/dislocker/dislocker-file /mnt/host 2>/dev/null; then
+                            echo "[+] Host NTFS filesystem mounted from BitLocker container."
+                            DISLOCKER_SUCCESS=1
+                            break
+                        fi
+                    fi
+                done
+                
+                if [ $DISLOCKER_SUCCESS -ne 1 ]; then
+                    echo "[!] Failed to automatically unlock/mount BitLocker partition."
+                fi
             else
-                echo ":: Authentication failure. Verification rejected."
+                echo "[!] Master Passphrase rejected. Could not open keys.luks."
             fi
-        done
-
-        mkdir -p /mnt/vault /mnt/host_decrypted /mnt/host_final
-        mount /dev/mapper/blindux_vault /mnt/vault
-        local raw_bitkey=$(cat /mnt/vault/bitlocker.key)
-        umount /mnt/vault && cryptsetup close blindux_vault
-
-        dislocker -r -V "${host_root}" -p"${raw_bitkey}" -- /mnt/host_decrypted
-        ntfs-3g /mnt/host_decrypted/dislocker-file /mnt/host_final
-    else
-        echo ":: Raw Host access configuration profile active."
-        mkdir -p /mnt/host_final
-        ntfs-3g "${host_root}" /mnt/host_final
-    fi
-
-    mkdir -p /new_root
-    mount -o loop "/mnt/host_final/${host_img}" /new_root
-}
-EOF
-    chmod +x "${hook_dir}/hooks/blindux"
-
-    mount --bind /dev "${MOUNT_ROOT}/dev"
-    mount --bind /dev/pts "${MOUNT_ROOT}/dev/pts"
-    mount --bind /proc "${MOUNT_ROOT}/proc"
-    mount --bind /sys "${MOUNT_ROOT}/sys"
-
-    log_info "Compiling native target internal hardware initramfs distribution layout..."
-    
-    set +e
-    chroot "${MOUNT_ROOT}" /bin/bash <<'EOF'
-    if command -v mkinitcpio &>/dev/null; then
-        echo "[INITRAMFS] Arch Linux/Manjaro mkinitcpio framework detected."
-        if grep -q "HOOKS=" /etc/mkinitcpio.conf; then
-            sed -i 's/\(udev\)/\1 blindux/' /etc/mkinitcpio.conf
-        fi
-        
-        local preset_file preset_name
-        preset_file=$(ls /etc/mkinitcpio.d/*.preset 2>/dev/null | head -n1)
-        
-        if [ -n "${preset_file}" ]; then
-            preset_name=$(basename "${preset_file}" .preset)
-            echo "[INITRAMFS] Found active kernel preset: ${preset_name}"
-            mkinitcpio -p "${preset_name}"
         else
-            echo "[WARNING] No .preset file found in /etc/mkinitcpio.d/. Falling back to direct build configuration."
-            local kernel_version
-            kernel_version=$(ls /usr/lib/modules/ | head -n1)
-            echo "[INITRAMFS] Compiling direct fallback layout for kernel version: ${kernel_version}"
-            mkinitcpio -c /etc/mkinitcpio.conf -g /boot/initramfs-linux.img -k "${kernel_version}"
+            # Branch 2: Standard unencrypted NTFS workflow
+            echo "[+] No keys.luks present. Scanning for unencrypted NTFS host partitions..."
+            NTFS_DEVS=$(blkid -t TYPE=ntfs -o device)
+            SELECTED_DEV=""
+            DEV_COUNT=$(echo "$NTFS_DEVS" | wc -w)
+            
+            if [ "$DEV_COUNT" -eq 1 ]; then
+                SELECTED_DEV="$NTFS_DEVS"
+                echo "[+] Single NTFS target discovered: $SELECTED_DEV"
+            elif [ "$DEV_COUNT" -gt 1 ]; then
+                echo "Available NTFS Partitions:"
+                select dev in $NTFS_DEVS; do
+                    if [ -n "$dev" ]; then
+                        SELECTED_DEV="$dev"
+                        break
+                    fi
+                done
+            fi
+
+            if [ -n "$SELECTED_DEV" ]; then
+                ntfs-3g "$SELECTED_DEV" /mnt/host
+            fi
+        fi
+
+        # Target In-Situ Image Provisioning Check
+        if [ ! -f "/mnt/host/${ROOT_IMG}" ]; then
+            echo "[+] Initial Boot: Provisioning container to /mnt/host/${ROOT_IMG}..."
+            mkdir -p "$(dirname "/mnt/host/${ROOT_IMG}")"
+            if [ -f /boot/blindux.fs.img ]; then
+                cp /boot/blindux.fs.img "/mnt/host/${ROOT_IMG}"
+                echo "[+] Expanding container to ${TARGET_SIZE}GB..."
+                truncate -s "${TARGET_SIZE}G" "/mnt/host/${ROOT_IMG}"
+                resize2fs "/mnt/host/${ROOT_IMG}"
+            else
+                echo "[!] Error: /boot/blindux.fs.img template not found on USB!"
+            fi
+        fi
+        
+        # Mount root container to loop device for root pivot
+        if [ -f "/mnt/host/${ROOT_IMG}" ]; then
+            LOOP_TARGET=$(losetup -f --show "/mnt/host/${ROOT_IMG}")
+            mount -o rw "$LOOP_TARGET" /new_root
+        else
+            echo "[!] Fatal: Target root container /mnt/host/${ROOT_IMG} not available."
         fi
     fi
+}
 EOF
-    CHROOT_STATUS=$?
-    set -e
 
-    if [ $CHROOT_STATUS -ne 0 ]; then
-        log_error "Initramfs compilation failed inside the chroot environment."
-    fi
+    # Generate Hook Installation Script with explicit binaries and modules
+    cat <<'EOF' > "${MOUNT_DIR}/etc/initcpio/install/blindux"
+build() {
+    add_module fuse
+    add_module loop
+    add_module ext4
+    add_module vfat
+    add_module nls_cp437
+    add_module nls_iso8859_1
 
-    log_info "Synchronizing fresh images kernels files back to standalone boot matrix..."
-    cp -f $(find "${MOUNT_ROOT}/boot" -name "vmlinuz*" -o -name "vmlinux*" | head -n1) "${MOUNT_BOOT}/vmlinuz-linux" 2>/dev/null || true
-    cp -f $(find "${MOUNT_ROOT}/boot" -name "initramfs*" -o -name "initrd*" | head -n1) "${MOUNT_BOOT}/initramfs-linux.img" 2>/dev/null || true
+    add_binary dislocker
+    add_binary dislocker-fuse
+    add_binary dislocker-file
+    add_binary ntfs-3g
+    add_binary mount.ntfs-3g
+    add_binary mount.ntfs
+    add_binary cryptsetup
+    add_binary resize2fs
+    add_binary truncate
+    add_binary blkid
+    add_binary losetup
+    add_binary lsblk
 
-    umount -lf "${MOUNT_ROOT}/dev/pts" 2>/dev/null || true
-    umount -lf "${MOUNT_ROOT}/dev" 2>/dev/null || true
-    umount -lf "${MOUNT_ROOT}/proc" 2>/dev/null || true
-    umount -lf "${MOUNT_ROOT}/sys" 2>/dev/null || true
-    
-    f0_save_checkpoint "4"
+    add_file /etc/fuse.conf 2>/dev/null || true
+
+    add_runscript
 }
 
-# ==============================================================================
-# FASE 4: RUNTIME AUTOMATION & SYSTEM LIFE CYCLE
-# ==============================================================================
-
-f4_inject_system_automations() {
-    if [ "${CHECKPOINT}" -gt "4" ]; then return 0; fi
-    log_phase "4.1" "Injecting Runtime System Automations inside Image"
-
-    local monitor_script="${MOUNT_ROOT}/usr/local/bin/blindux-disk-monitor"
-    mkdir -p "$(dirname "${monitor_script}")"
-    cat <<'EOF' > "${monitor_script}"
-#!/usr/bin/env bash
-FREE_SPACE_KB=$(df --output=avail / | tail -n1)
-FREE_SPACE_GB=$(( FREE_SPACE_KB / 1024 / 1024 ))
-if [ "${FREE_SPACE_GB}" -lt 1 ]; then
-    export DISPLAY=:0
-    export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
-    notify-send -u critical "Blindux low space alert!" "Only ${FREE_SPACE_GB}GB left inside your core container loop."
-fi
+help() {
+    echo "Injects Blindux smart storage detection, BitLocker unlocking, and loop mounting hooks."
+}
 EOF
-    chmod +x "${monitor_script}"
 
-    cat <<EOF > "${MOUNT_ROOT}/etc/systemd/system/blindux-monitor.service"
+    # Ensure blindux hook is registered in /etc/mkinitcpio.conf
+    echo "[+] Registering blindux hook in /etc/mkinitcpio.conf..."
+    if ! grep -q "blindux" "${MOUNT_DIR}/etc/mkinitcpio.conf"; then
+        sed -i 's/HOOKS=(\(.*\)filesystems\(.*\))/HOOKS=(\1filesystems blindux\2)/' "${MOUNT_DIR}/etc/mkinitcpio.conf" || \
+        sed -i 's/HOOKS=(\(.*\))/HOOKS=(\1 blindux)/' "${MOUNT_DIR}/etc/mkinitcpio.conf"
+    fi
+
+    # Rebuild initramfs inside chroot
+    echo "[+] Rebuilding initramfs image inside chroot..."
+    chroot "${MOUNT_DIR}" mkinitcpio -P
+    cp "${MOUNT_DIR}/boot/initramfs-linux.img" "${USB_MOUNT_DIR}/initramfs-linux.img"
+
+    # Inject Post-Boot Persistence Service (One-Shot)
+    echo "[+] Injecting Systemd Post-Boot One-Shot Persistence Service..."
+    cat <<EOF > "${MOUNT_DIR}/etc/systemd/system/blindux-persist.service"
 [Unit]
-Description=Blindux Space Alerts Daemon
+Description=Blindux Post-Boot UUID Consolidation Service
+After=multi-user.target
+
 [Service]
 Type=oneshot
-ExecStart=${monitor_script}
+ExecStart=/usr/local/bin/blindux-persist.sh
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
-    cat <<EOF > "${MOUNT_ROOT}/etc/systemd/system/blindux-monitor.timer"
+    cat <<'EOF' > "${MOUNT_DIR}/usr/local/bin/blindux-persist.sh"
+#!/bin/bash
+if grep -q "root=auto" /proc/cmdline; then
+    ACTIVE_NTFS=$(findmnt -n -o SOURCE /mnt/host 2>/dev/null || true)
+    if [ -n "$ACTIVE_NTFS" ]; then
+        HOST_UUID=$(blkid -s UUID -o value "$ACTIVE_NTFS")
+        mount /boot 2>/dev/null || true
+        if [ -f /boot/grub/grub.cfg ]; then
+            sed -i "s/root=auto/root=UUID=${HOST_UUID}/g" /boot/grub/grub.cfg
+            echo "Consolidated grub.cfg with fixed UUID: ${HOST_UUID}"
+        fi
+    fi
+fi
+EOF
+    chmod +x "${MOUNT_DIR}/usr/local/bin/blindux-persist.sh"
+    chroot "${MOUNT_DIR}" systemctl enable blindux-persist.service || true
+
+    # Phase 4 Automation: Space Monitor Service & Timer
+    echo "[+] Injecting Background Disk Space Monitor Service & Timer..."
+    cat <<'EOF' > "${MOUNT_DIR}/usr/local/bin/blindux-space-monitor.sh"
+#!/bin/bash
+FREE_MB=$(df -m / | awk 'NR==2 {print $4}')
+if [ "$FREE_MB" -lt 1024 ]; then
+    echo "[!] Warning: Low disk space in Blindux root image (${FREE_MB} MB remaining)."
+    logger -t blindux-monitor "Warning: Low disk space in Blindux root image (${FREE_MB} MB remaining)."
+fi
+EOF
+    chmod +x "${MOUNT_DIR}/usr/local/bin/blindux-space-monitor.sh"
+
+    cat <<EOF > "${MOUNT_DIR}/etc/systemd/system/blindux-space-monitor.service"
 [Unit]
-Description=Run Blindux Space Monitor Every 10 Minutes
+Description=Blindux Free Space Monitor
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/blindux-space-monitor.sh
+EOF
+
+    cat <<EOF > "${MOUNT_DIR}/etc/systemd/system/blindux-space-monitor.timer"
+[Unit]
+Description=Run Blindux Free Space Monitor every 10 minutes
+
 [Timer]
-OnBootSec=10min
+OnBootSec=2min
 OnUnitActiveSec=10min
+
 [Install]
 WantedBy=timers.target
 EOF
+    chroot "${MOUNT_DIR}" systemctl enable blindux-space-monitor.timer || true
 
-    local resize_script="${MOUNT_ROOT}/usr/local/bin/blindux-autoresize"
-    cat <<'EOF' > "${resize_script}"
-#!/usr/bin/env bash
-FREE_SPACE_KB=$(df --output=avail / | tail -n1)
-FREE_SPACE_GB=$(( FREE_SPACE_KB / 1024 / 1024 ))
-if [ "${FREE_SPACE_GB}" -lt 5 ]; then
-    truncate -s +5G /host/blindux/blindux.fs.img
-    resize2fs $(findmnt -n -o SOURCE /)
+    # Phase 4 Automation: Pacman Kernel Update Sync Hook
+    echo "[+] Injecting Pacman Kernel Update Sync Hook..."
+    mkdir -p "${MOUNT_DIR}/etc/pacman.d/hooks"
+    cat <<EOF > "${MOUNT_DIR}/etc/pacman.d/hooks/99-blindux-sync.hook"
+[Trigger]
+Type = Package
+Operation = Install
+Operation = Upgrade
+Target = linux
+
+[Action]
+Description = Synchronizing updated kernel and initramfs to Blindux USB...
+When = PostTransaction
+Exec = /usr/local/bin/blindux-sync-kernel.sh
+EOF
+
+    cat <<'EOF' > "${MOUNT_DIR}/usr/local/bin/blindux-sync-kernel.sh"
+#!/bin/bash
+if ! mountpoint -q /boot; then
+    mount /boot 2>/dev/null || true
+fi
+
+if mountpoint -q /boot; then
+    echo "[+] Syncing updated kernel and initramfs to /boot on USB..."
+    cp -u /boot/vmlinuz-linux /boot/vmlinuz-linux.new 2>/dev/null || true
+    sync
+    echo "[+] Kernel sync complete."
 fi
 EOF
-    chmod +x "${resize_script}"
+    chmod +x "${MOUNT_DIR}/usr/local/bin/blindux-sync-kernel.sh"
 
-    cat <<EOF > "${MOUNT_ROOT}/etc/systemd/system/blindux-autoresize.service"
-[Unit]
-Description=Dynamic Partition Growing Service
-Before=sysinit.target
-[Service]
-Type=oneshot
-ExecStart=${resize_script}
-[Install]
-WantedBy=sysinit.target
-EOF
+    # Clean up chroot binds
+    echo "[+] Dismantling chroot environment..."
+    umount -lf "${MOUNT_DIR}/dev/pts"
+    umount -lf "${MOUNT_DIR}/dev"
+    umount -lf "${MOUNT_DIR}/proc"
+    umount -lf "${MOUNT_DIR}/sys"
+    umount -lf "${MOUNT_DIR}"
+    umount -lf "${USB_MOUNT_DIR}"
 
-    local sync_script="${MOUNT_ROOT}/usr/local/bin/blindux-kernelsync"
-    cat <<'EOF' > "${sync_script}"
-#!/usr/bin/env bash
-BOOT_UUID=$(grep -oP 'UUID=\K\S+' /etc/fstab || true)
-if [ -z "$BOOT_UUID" ]; then exit 0; fi
-while true; do
-    DEV_PATH=$(blkid -U "${BOOT_UUID}" || true)
-    if [ -n "${DEV_PATH}" ]; then break; fi
-    export DISPLAY=:0
-    notify-send -u critical "Blindux Update Sync Alert" "Please insert your Blindux USB Boot token to finish structural kernel upgrade syncing!"
-    sleep 30
-done
-mount "${DEV_PATH}" /mnt/usb_boot
-cp /boot/vmlinuz-linux /mnt/usb_boot/
-cp /boot/initramfs-linux.img /mnt/usb_boot/
-umount /mnt/usb_boot
-notify-send "Blindux Sync Success" "Kernel payloads synchronized successfully."
-EOF
-    chmod +x "${sync_script}"
-
-    cat <<EOF | chroot "${MOUNT_ROOT}" /bin/bash
-    systemctl enable blindux-monitor.timer &>/dev/null || true
-    systemctl enable blindux-autoresize.service &>/dev/null || true
-EOF
-
-    umount "${MOUNT_ROOT}" 2>/dev/null || true
-    umount "${MOUNT_BOOT}" 2>/dev/null || true
-    
-    if [ -n "${BOOT_LOOP_DEV:-}" ]; then losetup -d "${BOOT_LOOP_DEV}" 2>/dev/null; fi
-    
-    rm -f "${STATE_FILE}"
-    log_success "All dynamic daemons injected. Session storage benchmarks complete."
+    echo -e "\n=================================================================="
+    echo "[SUCCESS] Blindux Installation & Provisioning Complete!"
+    echo "You may now reboot your computer and boot from the USB drive."
+    echo "=================================================================="
 }
 
-# ==============================================================================
-# FASE 5: OPTIONAL FLASHING PIPELINE
-# ==============================================================================
-
-f5_flash_physical_usb() {
-    if [ "${TARGET_USB}" != "None" ]; then
-        log_phase "5.2" "Streaming boot matrix assets directly into target USB media block"
-        log_info "Writing ${IMG_BOOT} directly to ${TARGET_USB} via dd streams..."
-        dd if="${IMG_BOOT}" of="${TARGET_USB}" bs=4M status=progress conv=fsync
-        log_success "Flashing onto target physical boundary completed safely."
-    else
-        log_phase "5.2" "Manual Flashing Deployment Summary"
-        echo -e "${YELLOW}Standalone build requested.${NC}"
-        echo "Deploy your master secure key boot assets manually to your hardware device via:"
-        echo -e "Command: ${GREEN}dd if=${IMG_BOOT} of=/dev/sdX bs=4M status=progress conv=fsync${NC}"
-    fi
-}
-
-# ==============================================================================
-# SCRIPT ORCHESTRATION PIPELINE
-# ==============================================================================
-
+# --- MAIN EXECUTION FLOW ---
 main() {
-    f0_initialize
-    f0_check_resume
-    f0_select_usb
-    f0_select_distro
-    f0_select_size
-    f0_gather_keys
-    
-    f1_create_system_image
-    f1_bootstrap_os
-    f1_configure_chroot
-    f1_optimize_compression
-    
-    f2_create_boot_disk
-    f2_secure_bitlocker_key
-    
-    f3_configure_bootloader
-    f3_generate_initramfs_hooks
-    f4_inject_system_automations
-    
-    f5_flash_physical_usb
-    
-    log_success "BLINDUX ARCHITECTURE ROUTINES FULLY IMPLEMENTED!"
+    check_root
+    init_workspace
+    phase0_input_gathering
+    phase1_provisioning
+    phase2_usb_layout
+    phase3_bootloader_initramfs
 }
 
 main "$@"
